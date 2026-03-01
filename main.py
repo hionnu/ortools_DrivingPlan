@@ -162,7 +162,13 @@ def _optimize(
             _parse_time(d.get("time_window_end", "20:00")) - DEPOT_START_MIN,
             MAX_WORK_MINS,
         ))
-        time_dim.CumulVar(r_idx).SetRange(tw_s, tw_e)
+        # ロック配送かつ HH:MM 完全一致（start == end）の場合: 指定時刻に厳密固定
+        if d.get("locked") and _parse_time(d.get("time_window_start", "08:00")) == _parse_time(d.get("time_window_end", "20:00")):
+            fixed = max(0, _parse_time(d.get("time_window_start", "08:00")) - DEPOT_START_MIN)
+            fixed = min(fixed, MAX_WORK_MINS)
+            time_dim.CumulVar(r_idx).SetRange(fixed, fixed)
+        else:
+            time_dim.CumulVar(r_idx).SetRange(tw_s, tw_e)
 
     for v_idx in range(num_vehicles):
         time_dim.CumulVar(routing.Start(v_idx)).SetRange(0, 0)
@@ -268,6 +274,7 @@ class DeliveryModel(BaseModel):
     demand_kg:           int   = 0
     time_window_start:   str   = "08:00"
     time_window_end:     str   = "20:00"
+    locked:              bool  = False
 
 
 class SettingsModel(BaseModel):
