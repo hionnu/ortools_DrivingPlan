@@ -5,100 +5,21 @@ main.py
 
 エンドポイント:
   GET  /          ヘルスチェック
-  POST /optimize  VRP 最適化実行（ジオコーディング → OR-Tools）
+  POST /optimize  VRP 最適化実行
 
 Render へのデプロイ:
   1. requirements.txt の依存関係をインストール
-  2. 環境変数 GEOCODING_API_KEY を Render ダッシュボードで設定
-  3. 起動コマンド: uvicorn main:app --host 0.0.0.0 --port $PORT
+  2. 起動コマンド: uvicorn main:app --host 0.0.0.0 --port $PORT
+  ※ 環境変数の設定は不要（ジオコーディングは GAS 側で実施）
 """
 
 import math
-import os
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-import requests
 from fastapi import FastAPI, HTTPException
 from ortools.constraint_solver import routing_enums_pb2, pywrapcp
 from pydantic import BaseModel, Field
-
-# Google Geocoding API キー（Render 環境変数から取得）
-GEOCODING_API_KEY = os.environ.get("GEOCODING_API_KEY", "")
-
-
-# ─────────────────────────────────────────────
-# ジオコーディング（並列・重複排除）
-# ─────────────────────────────────────────────
-
-def _geocode_one(address: str) -> tuple[str, tuple[float, float] | None]:
-    """
-    住所 → (lat, lng) に変換する。失敗時は (address, None) を返す。
-    モジュールレベルの GEOCODING_API_KEY を参照する。
-    """
-    try:
-        r = requests.get(
-            "https://maps.googleapis.com/maps/api/geocode/json",
-            params={"address": address, "language": "ja", "key": GEOCODING_API_KEY},
-            timeout=10,
-        )
-        data = r.json()
-        if data.get("status") == "OK" and data["results"]:
-            loc = data["results"][0]["geometry"]["location"]
-            return address, (loc["lat"], loc["lng"])
-    except Exception:
-        pass
-    return address, None
-
-
-def _batch_geocode(
-    deliveries: list[dict],
-) -> tuple[list[dict], list[dict]]:
-    """
-    lat/lng が 0 または未設定の配送データをまとめてジオコーディングする。
-
-    - 同一住所は 1 回のみ API を呼び出す（重複排除）
-    - ThreadPoolExecutor で並列処理（最大 5 並列）
-    - GEOCODING_API_KEY が未設定の場合はスキップ
-
-    Returns:
-        (更新済み deliveries, geocoded_list)
-        geocoded_list = [{"idx": int, "lat": float, "lng": float}, ...]
-    """
-    if not GEOCODING_API_KEY:
-        return deliveries, []
-
-    # lat=0 かつ lng=0 かつ address がある行を抽出
-    to_geocode = [
-        (i, d) for i, d in enumerate(deliveries)
-        if not (d.get("lat") and d.get("lng")) and d.get("address", "").strip()
-    ]
-    if not to_geocode:
-        return deliveries, []
-
-    # 住所の重複排除（順序保持）
-    unique_addresses = list(dict.fromkeys(
-        d["address"].strip() for _, d in to_geocode
-    ))
-
-    # 並列ジオコーディング
-    addr_to_coord: dict[str, tuple[float, float]] = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for address, coords in executor.map(_geocode_one, unique_addresses):
-            if coords:
-                addr_to_coord[address] = coords
-
-    # 結果を deliveries に反映
-    geocoded_list: list[dict] = []
-    for i, d in to_geocode:
-        addr = d.get("address", "").strip()
-        if addr in addr_to_coord:
-            lat, lng = addr_to_coord[addr]
-            deliveries[i] = {**d, "lat": lat, "lng": lng}
-            geocoded_list.append({"idx": d["idx"], "lat": lat, "lng": lng})
-
-    return deliveries, geocoded_list
 
 
 # ─────────────────────────────────────────────
@@ -156,7 +77,7 @@ def _build_distance_matrix(
 DEPOT_START_MIN = 8 * 60   # 08:00
 DEPOT_END_MIN   = 20 * 60  # 20:00
 MAX_WORK_MINS   = DEPOT_END_MIN - DEPOT_START_MIN  # 720分
-SOLVE_TIME_SEC  = 10       # OR-Tools 最大求解時間（秒）
+SOLVE_TIME_SEC  = 30       # OR-Tools 最大求解時間（秒）※件数が多い場合は増やしてよい
 
 
 def _parse_time(t_str: str) -> int:
@@ -317,8 +238,8 @@ def _optimize(
 
 app = FastAPI(
     title="配車最適化 API",
-    description="OR-Tools VRP ソルバー（時間窓・積載量・進入制限・並列ジオコーディング対応）",
-    version="1.1.0",
+    description="OR-Tools VRP ソルバー（時間窓・積載量・進入制限対応）",
+    version="1.0.0",
 )
 
 
@@ -339,9 +260,9 @@ class VehicleModel(BaseModel):
 class DeliveryModel(BaseModel):
     idx:                 int
     customer_name:       Optional[str] = ""
-    address:             Optional[str] = ""   # ジオコーディング用住所
-    lat:                 float = 0.0
-    lng:                 float = 0.0
+    address:             Optional[str] = ""
+    lat:                 float
+    lng:                 float
     require_small_truck: int   = 0
     service_time_min:    int   = 15
     demand_kg:           int   = 0
@@ -369,10 +290,9 @@ def root():
 @app.post("/optimize", summary="VRP 最適化実行")
 def optimize_route(req: OptimizeRequest):
     """
-    GAS から受け取ったデポ・車両・配送データを処理する。
-    1. lat/lng が未設定の配送先を並列ジオコーディング（重複排除）
-    2. OR-Tools で VRP を求解（最大 SOLVE_TIME_SEC 秒）
-    3. ルート + ジオコーディング済み座標 を返す
+    GAS から受け取ったデポ・車両・配送データを OR-Tools で最適化し、
+    各配送先の割当車両・配送順序・到着予想時刻（ETA）を返す。
+    ジオコーディングは GAS 側で実施済みの前提（lat/lng が設定されていること）。
     """
     if not req.deliveries:
         raise HTTPException(status_code=400, detail="deliveries が空です")
@@ -381,17 +301,20 @@ def optimize_route(req: OptimizeRequest):
     if not req.depots:
         raise HTTPException(status_code=400, detail="depots が空です")
 
+    # lat/lng が未設定の配送先を検出して警告
+    missing = [d.idx for d in req.deliveries if not d.lat and not d.lng]
+    if missing:
+        return {
+            "status":  "error",
+            "message": f"緯度経度が未設定の配送先があります（idx: {missing}）。住所を入力してジオコーディングを完了させてください。",
+        }
+
     start_ms = time.time()
 
-    # ① ジオコーディング（lat=0, lng=0 の配送先を補完）
-    deliveries = [d.model_dump() for d in req.deliveries]
-    deliveries, geocoded = _batch_geocode(deliveries)
-
-    # ② VRP 最適化
     result = _optimize(
         depots     = [d.model_dump() for d in req.depots],
         vehicles   = [v.model_dump() for v in req.vehicles],
-        deliveries = deliveries,
+        deliveries = [d.model_dump() for d in req.deliveries],
         settings   = req.settings.model_dump(),
     )
 
@@ -399,16 +322,14 @@ def optimize_route(req: OptimizeRequest):
 
     if result is None:
         return {
-            "status":    "error",
-            "message":   "最適解が見つかりませんでした。データを確認してください。",
-            "geocoded":  geocoded,   # ジオコーディング済み座標はエラー時も返す
+            "status":  "error",
+            "message": "最適解が見つかりませんでした。データを確認してください。",
         }
 
     routes, total_distance_km = result
     return {
         "status":            "success",
         "routes":            routes,
-        "geocoded":          geocoded,   # GAS がスプレッドシートへ書き戻す
         "total_distance_km": round(total_distance_km, 2),
         "solve_time_ms":     elapsed_ms,
     }
